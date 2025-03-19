@@ -72,7 +72,29 @@ $jobPrefixMailBox = "JM-Mailboxes-"
 $jobPrefixOneDrive = "JM-OneDrive-"
 $repository = "storj_cloud"
 
+<# notes: 
+1. 1 org only
+2. Repos: Specify list of repos.
+3. Add Sites/Teams functionality
+4. ensure ease for scheduling
+5. Job naming: Make it use existing job names, using that schema for new jobs.
+5.1. increment based on proxy tied to.. 
+5.2. Job Naming:  CompanySItesTeams-001, CompanySitesTeams-002, etc. 
+5.3.  Adding the Group Mailbox to the job
+6. For Tim: Should we include Group Mail in the SP/Teams for ease of restore entire team? AKA restore a team -> restores team, site, mail etc
+7. Modify script to print out numbers (no change); extra script;
+8. Archive & MB are split jobs
+9. Does this impact copy jobs?
+10. For existing jobs of 2k objects...is it a problem to add more? Would be ~3k objects
+11. Security groups are how users are done
 
+12. Grab group mail add to existin team/site job. Then look for new objects and add to jobs if <2000 objects.
+- Adding team, GM, site
+13. One script, scheduled and ran. 
+14. Can I log which things are where? 
+15. Can I have the script remove Groups that are no longer actual groups?
+ - 
+#>
 # get all orgs
 $organizations = Get-VBOOrganization
 $repo = Get-VBORepository -Name $repository
