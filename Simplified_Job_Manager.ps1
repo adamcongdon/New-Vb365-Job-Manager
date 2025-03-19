@@ -8,7 +8,7 @@ Param(
         if ($_ -lt 3 -or $_ -gt 3000) { throw "objectsPerJob must be between 3 and 3000" }
         $true
     })]
-    [int]$objectsPerJob = 600,
+    [int]$objectsPerJob = 3000,
     [ValidateSet("SharePoint", "Teams", "GroupMailbox")]$limitServiceTo,
     [string]$jobNamePattern = "M365Backup-{0:d3}",
     [switch]$withTeamsChats,
@@ -378,76 +378,87 @@ PROCESS {
     
     # Process new items
     $currentJob = $null
-    $currentSchedule = $baseSchedule
-    $repoIndex = 0
-    $objCount = 0
+$currentSchedule = $baseSchedule
+$repoIndex = 0
+$objCount = 0
+
+foreach ($obj in $objects) {
+    if (-not $obj.OriginalObject -or -not ($obj.Type -in @("Site", "Team", "GroupMailbox"))) {
+        "Skipping invalid object in processing list: $($obj.Type) - $($obj.OriginalObject)" | timelog
+        continue
+    }
     
-    foreach ($obj in $objects) {
-        if (-not $obj.OriginalObject -or -not ($obj.Type -in @("Site", "Team", "GroupMailbox"))) {
-            "Skipping invalid object in processing list: $($obj.Type) - $($obj.OriginalObject)" | timelog
-            continue
-        }
-        
-        $itemType = $obj.Type
-        $itemObject = $obj.OriginalObject
-        
-        switch ($itemType) {
-            "Site" { "Processing Site: {0} (URL: {1})" -f $itemObject.ToString(), $itemObject.URL | timelog }
-            "Team" { "Processing Team: {0} (Email: {1})" -f $itemObject.ToString(), $itemObject.Mail | timelog }
-            "GroupMailbox" { 
-                $name = if ($itemObject.DisplayName) { $itemObject.DisplayName } else { "Unnamed" }
-                "Processing GroupMailbox: {0} (GroupName: {1})" -f $name, $itemObject.GroupName | timelog
-            }
-        }
-        
-        # Apply filters
-        if ($includes -and !($includes | Where-Object { $itemObject.toString() -cmatch $_ })) { 
-            "Skipping {0} - no include match" -f $itemObject.ToString() | timelog
-            continue 
-        }
-        if ($excludes | Where-Object { $itemObject.toString() -cmatch $_ }) { 
-            "Skipping {0} - exclude match" -f $itemObject.ToString() | timelog
-            continue 
-        }
-        
-        # Find a job that already contains a related item (if any)
-        $relatedJob = $null
-        if ($itemType -eq "Team") {
-            $teamName = ($itemObject.Mail -split "@")[0].Replace(" ", "").ToLower()
+    $itemType = $obj.Type
+    $itemObject = $obj.OriginalObject
+    
+    switch ($itemType) {
+        "Site" { "Processing Site: {0} (URL: {1})" -f $obj.Object.Name, $obj.Object.Identifier | timelog }
+        "Team" { "Processing Team: {0} (Email: {1})" -f $obj.Object.Name, $obj.Object.Identifier | timelog }
+        "GroupMailbox" { "Processing GroupMailbox: {0} (GroupName: {1})" -f $obj.Object.Name, $obj.Object.Identifier | timelog }
+    }
+    
+    # Apply filters (unchanged)
+    if ($includes -and !($includes | Where-Object { $obj.Object.Name -cmatch $_ })) { 
+        "Skipping {0} - no include match" -f $obj.Object.Name | timelog
+        continue 
+    }
+    if ($excludes | Where-Object { $obj.Object.Name -cmatch $_ }) { 
+        "Skipping {0} - exclude match" -f $obj.Object.Name | timelog
+        continue 
+    }
+    
+    # Find a related job or one with space
+    $relatedJob = $null
+    $availableJob = $null
+    
+    # Check for related job
+    if ($itemType -eq "Team") {
+        $teamName = ($itemObject.Mail -split "@")[0].Replace(" ", "").ToLower()
+        $relatedJob = $existingJobs | Where-Object {
+            $jobItems = Get-VBOBackupItem -Job $_
+            $jobSites = $jobItems | Where-Object { $_.Type -eq "Site" }
+            $jobGroups = $jobItems | Where-Object { $_.Type -eq "Group" }
+            ($jobSites | Where-Object { ([uri]$_.Site.URL).Segments[-1].Replace(" ", "").ToLower() -eq $teamName }) -or
+            ($jobGroups | Where-Object { $_.Group.DisplayName.Replace(" ", "").Replace("M365Group", "").ToLower() -eq $teamName })
+        } | Select-Object -First 1
+    } elseif ($itemType -eq "GroupMailbox") {
+        if ($itemObject.DisplayName) {
+            $groupName = $itemObject.DisplayName.Replace(" ", "").Replace("M365Group", "").ToLower()
             $relatedJob = $existingJobs | Where-Object {
                 $jobItems = Get-VBOBackupItem -Job $_
                 $jobSites = $jobItems | Where-Object { $_.Type -eq "Site" }
-                $jobGroups = $jobItems | Where-Object { $_.Type -eq "Group" }
-                ($jobSites | Where-Object { ([uri]$_.Site.URL).Segments[-1].Replace(" ", "").ToLower() -eq $teamName }) -or
-                ($jobGroups | Where-Object { $_.Group.DisplayName.Replace(" ", "").Replace("M365Group", "").ToLower() -eq $teamName })
-            } | Select-Object -First 1
-        } elseif ($itemType -eq "GroupMailbox") {
-            if ($itemObject -and $itemObject.DisplayName) {
-                $groupName = $itemObject.DisplayName.Replace(" ", "").Replace("M365Group", "").ToLower()
-                $relatedJob = $existingJobs | Where-Object {
-                    $jobItems = Get-VBOBackupItem -Job $_
-                    $jobSites = $jobItems | Where-Object { $_.Type -eq "Site" }
-                    $jobTeams = $jobItems | Where-Object { $_.Type -eq "Team" }
-                    ($jobSites | Where-Object { $_.Site.ToString().Replace(" ", "").ToLower() -eq $groupName }) -or
-                    ($jobTeams | Where-Object { ($_.Team.Mail -split "@")[0].Replace(" ", "").ToLower() -eq $groupName })
-                } | Select-Object -First 1
-            }
-        } else { # SharePoint
-            $siteUrl = ([uri]$itemObject.URL).AbsolutePath.TrimEnd('/')
-            $siteName = $itemObject.ToString().Replace(" ", "").ToLower()
-            $relatedJob = $existingJobs | Where-Object {
-                $jobItems = Get-VBOBackupItem -Job $_
                 $jobTeams = $jobItems | Where-Object { $_.Type -eq "Team" }
-                $jobGroups = $jobItems | Where-Object { $_.Type -eq "Group" }
-                ($jobTeams | Where-Object { ($_.Team.Mail -split "@")[0].Replace(" ", "").ToLower() -eq $siteName }) -or
-                ($jobGroups | Where-Object { $_.Group.DisplayName.Replace(" ", "").Replace("M365Group", "").ToLower() -eq $siteName })
+                ($jobSites | Where-Object { $_.Site.ToString().Replace(" ", "").ToLower() -eq $groupName }) -or
+                ($jobTeams | Where-Object { ($_.Team.Mail -split "@")[0].Replace(" ", "").ToLower() -eq $groupName })
             } | Select-Object -First 1
         }
+    } else { # SharePoint
+        $siteUrl = ([uri]$itemObject.URL).AbsolutePath.TrimEnd('/')
+        $siteName = $itemObject.ToString().Replace(" ", "").ToLower()
+        $relatedJob = $existingJobs | Where-Object {
+            $jobItems = Get-VBOBackupItem -Job $_
+            $jobTeams = $jobItems | Where-Object { $_.Type -eq "Team" }
+            $jobGroups = $jobItems | Where-Object { $_.Type -eq "Group" }
+            ($jobTeams | Where-Object { ($_.Team.Mail -split "@")[0].Replace(" ", "").ToLower() -eq $siteName }) -or
+            ($jobGroups | Where-Object { $_.Group.DisplayName.Replace(" ", "").Replace("M365Group", "").ToLower() -eq $siteName })
+        } | Select-Object -First 1
+    }
+    
+    if ($relatedJob) {
+        $currentJob = $relatedJob
+        $objCount = (Get-VBOBackupItem -Job $currentJob).Count
+        "Using related job {0} with {1} items" -f $currentJob.Name, $objCount | timelog
+    } else {
+        # Check existing jobs for space
+        $availableJob = $existingJobs | Where-Object {
+            $itemCount = (Get-VBOBackupItem -Job $_).Count
+            $itemCount -lt $objectsPerJob
+        } | Sort-Object { (Get-VBOBackupItem -Job $_).Count } -Descending | Select-Object -First 1
         
-        if ($relatedJob) {
-            $currentJob = $relatedJob
+        if ($availableJob) {
+            $currentJob = $availableJob
             $objCount = (Get-VBOBackupItem -Job $currentJob).Count
-            "Using related job {0} with {1} items" -f $currentJob.Name, $objCount | timelog
+            "Using existing job {0} with {1} items (capacity: {2})" -f $currentJob.Name, $objCount, $objectsPerJob | timelog
         } elseif (!$currentJob -or $objCount -ge $objectsPerJob) {
             $jobName = $jobNamePattern -f $jobNum++
             $repo = $repos[$repoIndex++ % $repos.Count]
@@ -462,12 +473,9 @@ PROCESS {
                 }
                 if ($initialItem) {
                     switch ($itemType) {
-                        "Site" { "Creating new job {0} with initial item: Site {1} (URL: {2})" -f $jobName, $itemObject.ToString(), $itemObject.URL | timelog }
-                        "Team" { "Creating new job {0} with initial item: Team {1} (Email: {2})" -f $jobName, $itemObject.ToString(), $itemObject.Mail | timelog }
-                        "GroupMailbox" { 
-                            $name = if ($itemObject.DisplayName) { $itemObject.DisplayName } else { "Unnamed" }
-                            "Creating new job {0} with initial item: GroupMailbox {1} (GroupName: {2})" -f $jobName, $name, $itemObject.GroupName | timelog
-                        }
+                        "Site" { "Creating new job {0} with initial item: Site {1} (URL: {2})" -f $jobName, $obj.Object.Name, $obj.Object.Identifier | timelog }
+                        "Team" { "Creating new job {0} with initial item: Team {1} (Email: {2})" -f $jobName, $obj.Object.Name, $obj.Object.Identifier | timelog }
+                        "GroupMailbox" { "Creating new job {0} with initial item: GroupMailbox {1} (GroupName: {2})" -f $jobName, $obj.Object.Name, $obj.Object.Identifier | timelog }
                     }
                     $currentJob = Add-VBOJob -Organization $org -Name $jobName -Repository $repo `
                         -SchedulePolicy $currentSchedule -SelectedItems $initialItem
@@ -484,11 +492,12 @@ PROCESS {
                 "Using existing job {0} with {1} items" -f $jobName, $objCount | timelog
             }
         }
-        
-        if (-not $currentJob) {
-            "Skipping item {0} due to failure in job creation" -f $itemObject.ToString() | timelog
-            continue
-        }
+    }
+    
+    if (-not $currentJob) {
+        "Skipping item {0} due to failure in job creation" -f $obj.Object.Name | timelog
+        continue
+    }
         
         # Add items to the job
         switch ($itemType) {
