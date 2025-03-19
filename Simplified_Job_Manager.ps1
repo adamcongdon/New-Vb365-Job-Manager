@@ -45,7 +45,10 @@ DynamicParam {
 
 BEGIN {
     # Basic logging
-    filter timelog { "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss"): $_" }
+    filter timelog { 
+        $message = "$(Get-Date -Format "yyyy-MM-dd HH:mm:ss"): $_"
+        Write-Host $message # Write to host/console, which gets captured by Start-Transcript
+    }
     
     # Set defaults
     if (!$baseSchedule) {
@@ -63,6 +66,8 @@ BEGIN {
 }
 
 PROCESS {
+    $jobAssignments = @{}
+    
     "Starting VB365 Job Manager" | timelog
     "Parameters: limitServiceTo=$limitServiceTo, withGroupMailbox=$withGroupMailbox, objectsPerJob=$objectsPerJob" | timelog
     
@@ -72,78 +77,193 @@ PROCESS {
     
     # Get objects to process
     $sites = if (!$limitServiceTo -or $limitServiceTo -eq "SharePoint") { 
-        Get-VBOOrganizationSite -Organization $org -NotInJob 
+        $rawSites = Get-VBOOrganizationSite -Organization $org -NotInJob
+        $validSites = $rawSites | Where-Object { 
+            $_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationSite] -and $_.ToString() -and $_.URL
+        }
+        $invalidSites = $rawSites | Where-Object { 
+            -not ($_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationSite] -and $_.ToString() -and $_.URL)
+        }
+        if ($invalidSites) {
+            "Debug: Found {0} invalid SharePoint sites: {1}" -f $invalidSites.Count, ($invalidSites | ForEach-Object { "Site: $_" } | Join-String -Separator ", ") | timelog
+        }
+        "Found {0} SharePoint sites not in jobs" -f $validSites.Count | timelog
+        if ($validSites.Count -gt 0) {
+            "SharePoint sites not in jobs: {0}" -f ($validSites | ForEach-Object { 
+                "$($_.ToString()) (URL: $($_.URL))"
+            } | Join-String -Separator ", ") | timelog
+        }
+        $validSites
     } else { @() }
-    "Found {0} SharePoint sites not in jobs" -f $sites.Count | timelog
-    if ($sites.Count -gt 0) {
-        "SharePoint sites not in jobs: {0}" -f ($sites | ForEach-Object { 
-            "$($_.ToString()) (URL: $($_.URL))"
-        } | Join-String -Separator ", ") | timelog
-    }
-    
+
     $teams = if (!$limitServiceTo -or $limitServiceTo -eq "Teams") { 
-        Get-VBOOrganizationTeam -NotInJob -Organization $org 
+        $rawTeams = Get-VBOOrganizationTeam -NotInJob -Organization $org
+        $validTeams = $rawTeams | Where-Object { 
+            $_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationTeam] -and $_.ToString() -and $_.Mail
+        }
+        $invalidTeams = $rawTeams | Where-Object { 
+            -not ($_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationTeam] -and $_.ToString() -and $_.Mail)
+        }
+        if ($invalidTeams) {
+            "Debug: Found {0} invalid Teams: {1}" -f $invalidTeams.Count, ($invalidTeams | ForEach-Object { "Team: $_" } | Join-String -Separator ", ") | timelog
+        }
+        "Found {0} Teams not in jobs" -f $validTeams.Count | timelog
+        if ($validTeams.Count -gt 0) {
+            "Teams not in jobs: {0}" -f ($validTeams | ForEach-Object { 
+                "$($_.ToString()) (Email: $($_.Mail))"
+            } | Join-String -Separator ", ") | timelog
+        }
+        $validTeams
     } else { @() }
-    "Found {0} Teams not in jobs" -f $teams.Count | timelog
-    if ($teams.Count -gt 0) {
-        "Teams not in jobs: {0}" -f ($teams | ForEach-Object { 
-            "$($_.ToString()) (Email: $($_.Mail))"
-        } | Join-String -Separator ", ") | timelog
-    }
-    
+
     $groupMailboxes = if (!$limitServiceTo -or $limitServiceTo -eq "GroupMailbox") { 
-        $groups = Get-VBOOrganizationGroup -Organization $org -NotInJob | Where-Object { $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationGroup] }
-        "Found {0} GroupMailboxes not in jobs" -f $groups.Count | Out-Null; "Found {0} GroupMailboxes not in jobs" -f $groups.Count | timelog
-        if ($groups.Count -gt 0) {
-            "GroupMailboxes not in jobs: {0}" -f ($groups | ForEach-Object { 
+        $rawGroups = Get-VBOOrganizationGroup -Organization $org -NotInJob
+        $validGroups = $rawGroups | Where-Object { 
+            $_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationGroup] -and $_.ToString() -and $_.GroupName -and $_.GroupName -ne '' -and $_.DisplayName -and $_.DisplayName -ne ''
+        }
+        $invalidGroups = $rawGroups | Where-Object { 
+            -not ($_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationGroup] -and $_.ToString() -and $_.GroupName -and $_.GroupName -ne '' -and $_.DisplayName -and $_.DisplayName -ne '')
+        }
+        if ($invalidGroups) {
+            "Debug: Found {0} invalid GroupMailboxes: {1}" -f $invalidGroups.Count, ($invalidGroups | ForEach-Object { 
+                "Group: $_, Properties: $($_.PSObject.Properties | ForEach-Object { $_.Name + '=' + $_.Value } | Join-String -Separator ', ')"
+            } | Join-String -Separator "; ") | timelog
+        }
+        "Found {0} GroupMailboxes not in jobs" -f $validGroups.Count | timelog
+        if ($validGroups.Count -gt 0) {
+            "GroupMailboxes not in jobs: {0}" -f ($validGroups | ForEach-Object { 
                 $name = if ($_.DisplayName) { $_.DisplayName } else { "Unnamed" }
-                "$name (SiteUrl: $($_.SiteUrl), Email: $($_.Email))"
-            } | Join-String -Separator ", ") | Out-Null; "GroupMailboxes not in jobs: {0}" -f ($groups | ForEach-Object { 
-                $name = if ($_.DisplayName) { $_.DisplayName } else { "Unnamed" }
-                "$name (SiteUrl: $($_.SiteUrl), Email: $($_.Email))"
+                "Debug: GroupMailbox - Name: $name, GroupName: $($_.GroupName), Properties: $($_.PSObject.Properties | ForEach-Object { $_.Name + '=' + $_.Value } | Join-String -Separator ', ')" | timelog
+                "$name (SiteUrl: $($_.SiteUrl), GroupName: $($_.GroupName))"
             } | Join-String -Separator ", ") | timelog
         } else {
-            "No GroupMailboxes found to process" | Out-Null; "No GroupMailboxes found to process" | timelog
+            "No GroupMailboxes found to process" | timelog
         }
-        $groups
+        $validGroups
     } else { @() }
-    
+
+    # Check if there are no items to process
+    if ($sites.Count -eq 0 -and $teams.Count -eq 0 -and $groupMailboxes.Count -eq 0) {
+        "No items (SharePoint sites, Teams, or GroupMailboxes) found to process. All items may already be in jobs." | timelog
+        return
+    }
+
     # Determine primary objects to process
     $objects = switch ($limitServiceTo) {
-        "Teams" { $teams | Where-Object { $_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationTeam] } | ForEach-Object { [PSCustomObject]@{ Type = "Team"; Object = $_ } } }
-        "GroupMailbox" { $groupMailboxes | Where-Object { $_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationGroup] } | ForEach-Object { [PSCustomObject]@{ Type = "GroupMailbox"; Object = $_ } } }
+        "Teams" { 
+            $teams | ForEach-Object { 
+                if ($_.Mail -and $_.DisplayName) {
+                    [PSCustomObject]@{ 
+                        Type = "Team"; 
+                        Object = [PSCustomObject]@{ 
+                            Name = $_.DisplayName; 
+                            Identifier = $_.Mail 
+                        } 
+                    }
+                } else {
+                    "Debug: Skipping invalid Team object: $_" | timelog
+                    $null
+                }
+            } | Where-Object { $_ }
+        }
+        "GroupMailbox" { 
+            $groupMailboxes | ForEach-Object { 
+                if ($_.GroupName -and $_.DisplayName) {
+                    [PSCustomObject]@{ 
+                        Type = "GroupMailbox"; 
+                        Object = [PSCustomObject]@{ 
+                            Name = $_.DisplayName; 
+                            Identifier = $_.GroupName 
+                        } 
+                    }
+                } else {
+                    "Debug: Skipping invalid GroupMailbox object: $_" | timelog
+                    $null
+                }
+            } | Where-Object { $_ }
+        }
         default { 
-            # If no limit, process all types (Sites, Teams, GroupMailboxes) in a combined list
             if (!$limitServiceTo) {
                 $combined = @()
-                $combined += $sites | Where-Object { $_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationSite] } | ForEach-Object { [PSCustomObject]@{ Type = "Site"; Object = $_ } }
-                $combined += $teams | Where-Object { $_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationTeam] } | ForEach-Object { [PSCustomObject]@{ Type = "Team"; Object = $_ } }
-                $combined += $groupMailboxes | Where-Object { $_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationGroup] } | ForEach-Object { [PSCustomObject]@{ Type = "GroupMailbox"; Object = $_ } }
-                # Add debug logging to inspect objects
+                $combined += $sites | ForEach-Object { 
+                    if ($_.URL -and $_.Name) {
+                        [PSCustomObject]@{ 
+                            Type = "Site"; 
+                            OriginalObject = $_;  # Store the original for later use
+                            Object = [PSCustomObject]@{ 
+                                Name = $_.Name; 
+                                Identifier = $_.URL 
+                            } 
+                        }
+                    } else {
+                        "Debug: Skipping invalid Site object: $_" | timelog
+                        $null
+                    }
+                }
+                $combined += $teams | ForEach-Object { 
+                    if ($_.Mail -and $_.DisplayName) {
+                        [PSCustomObject]@{ 
+                            Type = "Team"; 
+                            OriginalObject = $_; 
+                            Object = [PSCustomObject]@{ 
+                                Name = $_.DisplayName; 
+                                Identifier = $_.Mail 
+                            } 
+                        }
+                    } else {
+                        "Debug: Skipping invalid Team object: $_" | timelog
+                        $null
+                    }
+                }
+                $combined += $groupMailboxes | ForEach-Object { 
+                    if ($_.GroupName -and $_.DisplayName) {
+                        [PSCustomObject]@{ 
+                            Type = "GroupMailbox"; 
+                            OriginalObject = $_; 
+                            Object = [PSCustomObject]@{ 
+                                Name = $_.DisplayName; 
+                                Identifier = $_.GroupName 
+                            } 
+                        }
+                    } else {
+                        "Debug: Skipping invalid GroupMailbox object: $_" | timelog
+                        $null
+                    }
+                } | Where-Object { $_ }
                 "Debug: Raw objects count: $($combined.Count)" | timelog
-                $combined | ForEach-Object { "Debug: Object Type: $($_.Type), Object: $($_.Object)" | timelog }
-                $combined | Where-Object { $_.Object -and $_.Object -ne $null }
+                $combined | ForEach-Object { "Debug: Object Type: $($_.Type), Object: $($_.Object.Name) (Identifier: $($_.Object.Identifier))" | timelog }
+                $combined
             } else {
-                $sites | Where-Object { $_ -and $_ -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationSite] } | ForEach-Object { [PSCustomObject]@{ Type = "Site"; Object = $_ } }
+                $sites | ForEach-Object { 
+                    if ($_.URL -and $_.Name) {
+                        [PSCustomObject]@{ 
+                            Type = "Site"; 
+                            Object = [PSCustomObject]@{ 
+                                Name = $_.Name; 
+                                Identifier = $_.URL 
+                            } 
+                        }
+                    } else {
+                        "Debug: Skipping invalid Site object: $_" | timelog
+                        $null
+                    }
+                } | Where-Object { $_ }
             }
         }
     }
     "Processing {0} primary objects" -f $objects.Count | timelog
     if ($objects.Count -gt 0) {
         "Primary objects to process: {0}" -f ($objects | ForEach-Object {
-            if ($_.Object -and ($_.Type -eq "Site" -or $_.Type -eq "Team" -or $_.Type -eq "GroupMailbox")) {
-                switch ($_.Type) {
-                    "Site" { "Site: $($_.Object.ToString()) (URL: $($_.Object.URL))" }
-                    "Team" { "Team: $($_.Object.ToString()) (Email: $($_.Object.Mail))" }
-                    "GroupMailbox" { 
-                        $name = if ($_.Object.DisplayName) { $_.Object.DisplayName } else { "Unnamed" }
-                        "GroupMailbox: $name (Email: $($_.Object.Email))"
-                    }
-                }
-            } else {
-                "Skipping invalid object of type $($_.Type) with Object: $($_.Object)"
-            }
-        } | Where-Object { $_ } | Join-String -Separator ", ") | timelog
+    if (-not $_.Object -or -not ($_.Type -in @("Site", "Team", "GroupMailbox"))) {
+        "Skipping invalid object of type $($_.Type) with Object: $($_.Object)"
+    } else {
+        switch ($_.Type) {
+            "Site" { "Site: $($_.Object.Name) (URL: $($_.Object.Identifier))" }
+            "Team" { "Team: $($_.Object.Name) (Email: $($_.Object.Identifier))" }
+            "GroupMailbox" { "GroupMailbox: $($_.Object.Name) (GroupName: $($_.Object.Identifier))" }
+        }
+    }
+} | Where-Object { $_ } | Join-String -Separator ", ") | timelog
     }
     
     # Get all existing jobs matching the pattern
@@ -202,13 +322,15 @@ PROCESS {
                 if ($group -and $group -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationGroup]) {
                     $groupItem = New-VBOBackupItem -Group $group -GroupMailbox:$withGroupMailbox
                     try {
-                        $groupIdentifier = if ($group.DisplayName) { $group.DisplayName } else { $group.Email }
+                        $groupIdentifier = if ($group.DisplayName) { $group.DisplayName } else { $group.GroupName }
                         Add-VBOBackupItem -Job $job -BackupItem $groupItem -ErrorAction Stop
-                        "Added missing GroupMailbox {0} (Email: {1}) to job {2} (Mailbox included: {3})" -f $groupIdentifier, $group.Email, $job.Name, $withGroupMailbox | timelog
+                        "Added missing GroupMailbox {0} (GroupName: {1}) to job {2} (Mailbox included: {3})" -f $groupIdentifier, $group.GroupName, $job.Name, $withGroupMailbox | timelog
+                        if (-not $jobAssignments[$job.Name]) { $jobAssignments[$job.Name] = @() }
+                        $jobAssignments[$job.Name] += "GroupMailbox: $groupIdentifier (GroupName: $($group.GroupName))"
                         # Remove from $groupMailboxes to avoid re-adding later
-                        $groupMailboxes = $groupMailboxes | Where-Object { $_.Email -ne $group.Email }
+                        $groupMailboxes = $groupMailboxes | Where-Object { $_.GroupName -ne $group.GroupName }
                     } catch {
-                        "Failed to add missing GroupMailbox {0} (Email: {1}) to job {2}: {3}" -f $groupIdentifier, $group.Email, $job.Name, $_.Exception.Message | timelog
+                        "Failed to add missing GroupMailbox {0} (GroupName: {1}) to job {2}: {3}" -f $groupIdentifier, $group.GroupName, $job.Name, $_.Exception.Message | timelog
                     }
                 }
             }
@@ -239,13 +361,15 @@ PROCESS {
                 if ($group -and $group -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationGroup]) {
                     $groupItem = New-VBOBackupItem -Group $group -GroupMailbox:$withGroupMailbox
                     try {
-                        $groupIdentifier = if ($group.DisplayName) { $group.DisplayName } else { $group.Email }
+                        $groupIdentifier = if ($group.DisplayName) { $group.DisplayName } else { $group.GroupName }
                         Add-VBOBackupItem -Job $job -BackupItem $groupItem -ErrorAction Stop
-                        "Added missing GroupMailbox {0} (Email: {1}) to job {2} (Mailbox included: {3})" -f $groupIdentifier, $group.Email, $job.Name, $withGroupMailbox | timelog
+                        "Added missing GroupMailbox {0} (GroupName: {1}) to job {2} (Mailbox included: {3})" -f $groupIdentifier, $group.GroupName, $job.Name, $withGroupMailbox | timelog
+                        if (-not $jobAssignments[$job.Name]) { $jobAssignments[$job.Name] = @() }
+                        $jobAssignments[$job.Name] += "GroupMailbox: $groupIdentifier (GroupName: $($group.GroupName))"
                         # Remove from $groupMailboxes to avoid re-adding later
-                        $groupMailboxes = $groupMailboxes | Where-Object { $_.Email -ne $group.Email }
+                        $groupMailboxes = $groupMailboxes | Where-Object { $_.GroupName -ne $group.GroupName }
                     } catch {
-                        "Failed to add missing GroupMailbox {0} (Email: {1}) to job {2}: {3}" -f $groupIdentifier, $group.Email, $job.Name, $_.Exception.Message | timelog
+                        "Failed to add missing GroupMailbox {0} (GroupName: {1}) to job {2}: {3}" -f $groupIdentifier, $group.GroupName, $job.Name, $_.Exception.Message | timelog
                     }
                 }
             }
@@ -259,20 +383,20 @@ PROCESS {
     $objCount = 0
     
     foreach ($obj in $objects) {
-        if (-not $obj.Object -or -not ($obj.Type -in @("Site", "Team", "GroupMailbox"))) {
-            "Skipping invalid object in processing list: $($obj.Type) - $($obj.Object)" | timelog
+        if (-not $obj.OriginalObject -or -not ($obj.Type -in @("Site", "Team", "GroupMailbox"))) {
+            "Skipping invalid object in processing list: $($obj.Type) - $($obj.OriginalObject)" | timelog
             continue
         }
         
         $itemType = $obj.Type
-        $itemObject = $obj.Object
+        $itemObject = $obj.OriginalObject
         
         switch ($itemType) {
             "Site" { "Processing Site: {0} (URL: {1})" -f $itemObject.ToString(), $itemObject.URL | timelog }
             "Team" { "Processing Team: {0} (Email: {1})" -f $itemObject.ToString(), $itemObject.Mail | timelog }
             "GroupMailbox" { 
                 $name = if ($itemObject.DisplayName) { $itemObject.DisplayName } else { "Unnamed" }
-                "Processing GroupMailbox: {0} (Email: {1})" -f $name, $itemObject.Email | timelog
+                "Processing GroupMailbox: {0} (GroupName: {1})" -f $name, $itemObject.GroupName | timelog
             }
         }
         
@@ -342,7 +466,7 @@ PROCESS {
                         "Team" { "Creating new job {0} with initial item: Team {1} (Email: {2})" -f $jobName, $itemObject.ToString(), $itemObject.Mail | timelog }
                         "GroupMailbox" { 
                             $name = if ($itemObject.DisplayName) { $itemObject.DisplayName } else { "Unnamed" }
-                            "Creating new job {0} with initial item: GroupMailbox {1} (Email: {2})" -f $jobName, $name, $itemObject.Email | timelog
+                            "Creating new job {0} with initial item: GroupMailbox {1} (GroupName: {2})" -f $jobName, $name, $itemObject.GroupName | timelog
                         }
                     }
                     $currentJob = Add-VBOJob -Organization $org -Name $jobName -Repository $repo `
@@ -374,6 +498,8 @@ PROCESS {
                     Add-VBOBackupItem -Job $currentJob -BackupItem $item -ErrorAction Stop
                     "Added Team {0} (Email: {1}) to job {2}" -f $itemObject.ToString(), $itemObject.Mail, $currentJob.Name | timelog
                     $objCount++
+                    if (-not $jobAssignments[$currentJob.Name]) { $jobAssignments[$currentJob.Name] = @() }
+                    $jobAssignments[$currentJob.Name] += "Team: $($itemObject.ToString()) (Email: $($itemObject.Mail))"
                 } catch {
                     "Failed to add Team {0} (Email: {1}) to job {2}: {3}" -f $itemObject.ToString(), $itemObject.Mail, $currentJob.Name, $_.Exception.Message | timelog
                 }
@@ -382,12 +508,14 @@ PROCESS {
                 if ($itemObject -and $itemObject -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationGroup]) {
                     $item = New-VBOBackupItem -Group $itemObject -GroupMailbox:$withGroupMailbox
                     try {
-                        $groupIdentifier = if ($itemObject.DisplayName) { $itemObject.DisplayName } else { $itemObject.Email }
+                        $groupIdentifier = if ($itemObject.DisplayName) { $itemObject.DisplayName } else { $itemObject.GroupName }
                         Add-VBOBackupItem -Job $currentJob -BackupItem $item -ErrorAction Stop
-                        "Added GroupMailbox {0} (Email: {1}) to job {2} (Mailbox included: {3})" -f $groupIdentifier, $itemObject.Email, $currentJob.Name, $withGroupMailbox | timelog
+                        "Added GroupMailbox {0} (GroupName: {1}) to job {2} (Mailbox included: {3})" -f $groupIdentifier, $itemObject.GroupName, $currentJob.Name, $withGroupMailbox | timelog
                         $objCount++
+                        if (-not $jobAssignments[$currentJob.Name]) { $jobAssignments[$currentJob.Name] = @() }
+                        $jobAssignments[$currentJob.Name] += "GroupMailbox: $groupIdentifier (GroupName: $($itemObject.GroupName))"
                     } catch {
-                        "Failed to add GroupMailbox {0} (Email: {1}) to job {2}: {3}" -f $itemObject.ToString(), $itemObject.Email, $currentJob.Name, $_.Exception.Message | timelog
+                        "Failed to add GroupMailbox {0} (GroupName: {1}) to job {2}: {3}" -f $itemObject.ToString(), $itemObject.GroupName, $currentJob.Name, $_.Exception.Message | timelog
                     }
                 } else {
                     "Skipping invalid GroupMailbox object: $($itemObject)" | timelog
@@ -399,6 +527,8 @@ PROCESS {
                     Add-VBOBackupItem -Job $currentJob -BackupItem $siteItem -ErrorAction Stop
                     "Added Site {0} (URL: {1}) to job {2}" -f $itemObject.ToString(), $itemObject.URL, $currentJob.Name | timelog
                     $objCount++
+                    if (-not $jobAssignments[$currentJob.Name]) { $jobAssignments[$currentJob.Name] = @() }
+                    $jobAssignments[$currentJob.Name] += "Site: $($itemObject.ToString()) (URL: $($itemObject.URL))"
                 } catch {
                     "Failed to add Site {0} (URL: {1}) to job {2}: {3}" -f $itemObject.ToString(), $itemObject.URL, $currentJob.Name, $_.Exception.Message | timelog
                 }
@@ -412,6 +542,8 @@ PROCESS {
                             Add-VBOBackupItem -Job $currentJob -BackupItem $teamItem -ErrorAction Stop
                             "Added matching Team {0} (Email: {1}) to job {2}" -f $team.ToString(), $team.Mail, $currentJob.Name | timelog
                             $objCount++
+                            if (-not $jobAssignments[$currentJob.Name]) { $jobAssignments[$currentJob.Name] = @() }
+                            $jobAssignments[$currentJob.Name] += "Team: $($team.ToString()) (Email: $($team.Mail))"
                             # Remove from $teams to avoid re-adding later
                             $teams = $teams | Where-Object { $_.Mail -ne $team.Mail }
                         } catch {
@@ -438,21 +570,23 @@ PROCESS {
                     if ($group -and $group -is [Veeam.Archiver.PowerShell.Model.VBOOrganizationGroup]) {
                         $groupItem = New-VBOBackupItem -Group $group -GroupMailbox:$withGroupMailbox
                         try {
-                            $groupIdentifier = if ($group.DisplayName) { $group.DisplayName } else { $group.Email }
+                            $groupIdentifier = if ($group.DisplayName) { $group.DisplayName } else { $group.GroupName }
                             Add-VBOBackupItem -Job $currentJob -BackupItem $groupItem -ErrorAction Stop
-                            "Added matching GroupMailbox {0} (Email: {1}) to job {2} (Mailbox included: {3})" -f $groupIdentifier, $group.Email, $currentJob.Name, $withGroupMailbox | timelog
+                            "Added matching GroupMailbox {0} (GroupName: {1}) to job {2} (Mailbox included: {3})" -f $groupIdentifier, $group.GroupName, $currentJob.Name, $withGroupMailbox | timelog
                             $objCount++
+                            if (-not $jobAssignments[$currentJob.Name]) { $jobAssignments[$currentJob.Name] = @() }
+                            $jobAssignments[$currentJob.Name] += "GroupMailbox: $groupIdentifier (GroupName: $($group.GroupName))"
                             # Remove from $groupMailboxes to avoid re-adding later
-                            $groupMailboxes = $groupMailboxes | Where-Object { $_.Email -ne $group.Email }
+                            $groupMailboxes = $groupMailboxes | Where-Object { $_.GroupName -ne $group.GroupName }
                         } catch {
-                            "Failed to add GroupMailbox {0} (Email: {1}) to job {2}: {3}" -f $groupIdentifier, $group.Email, $currentJob.Name, $_.Exception.Message | timelog
+                            "Failed to add GroupMailbox {0} (GroupName: {1}) to job {2}: {3}" -f $groupIdentifier, $group.GroupName, $currentJob.Name, $_.Exception.Message | timelog
                         }
                     } else {
                         "No matching GroupMailbox found for site {0} (URL: {1}, Name: {2}) in job {3}" -f $itemObject.ToString(), $itemObject.URL, $siteName, $currentJob.Name | timelog
                         if ($groupMailboxes.Count -gt 0) {
                             "Available GroupMailboxes: {0}" -f ($groupMailboxes | ForEach-Object { 
                                 $normalizedName = if ($_.DisplayName) { $_.DisplayName.Replace(" ", "").Replace("M365Group", "").ToLower() } else { "N/A" }
-                                "$($_.DisplayName) (Normalized Name: $normalizedName, SiteUrl: $($_.SiteUrl), Email: $($_.Email))"
+                                "$($_.DisplayName) (Normalized Name: $normalizedName, SiteUrl: $($_.SiteUrl), GroupName: $($_.GroupName))"
                             } | Join-String -Separator ", ") | timelog
                         }
                     }
@@ -463,5 +597,10 @@ PROCESS {
 }
 
 END {
+    "Summary of object assignments to jobs:" | timelog
+    foreach ($jobName in $jobAssignments.Keys) {
+        "Job $jobName contains:" | timelog
+        $jobAssignments[$jobName] | ForEach-Object { "  - $_" | timelog }
+    }
     Stop-Transcript
 }
